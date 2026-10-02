@@ -1,0 +1,92 @@
+<#
+.SYNOPSIS
+    Public/paylaşımlı sistemlerde oturum açılmamış (loaded olmayan) kullanıcı
+    profillerini ilerleme yüzdesi göstererek siler.
+
+.DESCRIPTION
+    Win32_UserProfile nesnelerini tek tek işler (toplu silme yerine), böylece:
+      - Tek bir uzun komut yerine birçok küçük işlem çalışır, bir profilde
+        sorun çıksa bile diğerleri etkilenmez.
+      - Write-Progress ile anlık yüzdelik ilerleme gösterilir.
+      - Timeout YOKTUR: her profil ne kadar sürerse sürsün sonuna kadar
+        beklenir, script asla "zaman aşımı" nedeniyle bir profili atlamaz.
+      - Başarısız profiller diğerlerini durdurmaz, log'a yazılır.
+
+.PARAMETER LogPath
+    Sonuç log dosyasının yolu. Varsayılan: script ile aynı klasörde
+    ProfileCleanup_<tarih>.log
+
+.EXAMPLE
+    .\Remove-StaleProfiles.ps1
+    .\Remove-StaleProfiles.ps1 -WhatIf
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [string]$LogPath = "$PSScriptRoot\ProfileCleanup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+)
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Add-Content -Path $LogPath -Value $line
+    switch ($Level) {
+        "ERROR" { Write-Host $line -ForegroundColor Red }
+        "WARN"  { Write-Host $line -ForegroundColor Yellow }
+        "OK"    { Write-Host $line -ForegroundColor Green }
+        default { Write-Host $line }
+    }
+}
+
+Write-Log "===== Profil temizleme başladı ====="
+
+# 1) Silinecek profilleri belirle (sistem profilleri ve aktif oturumlar hariç)
+$profiles = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.Special -and -not $_.Loaded }
+
+$total = $profiles.Count
+
+if ($total -eq 0) {
+    Write-Log "Silinecek profil bulunamadı." "OK"
+    return
+}
+
+Write-Log "Toplam $total profil silinecek."
+
+$success = 0
+$failed  = 0
+$current = 0
+
+foreach ($profile in $profiles) {
+    $current++
+    $localPath = $profile.LocalPath
+    $percent = [math]::Round(($current / $total) * 100, 1)
+
+    Write-Progress -Activity "Kullanıcı profilleri siliniyor" `
+        -Status "$current / $total  -  $localPath  (%$percent)" `
+        -PercentComplete $percent
+
+    if (-not $PSCmdlet.ShouldProcess($localPath, "Remove-CimInstance")) {
+        continue
+    }
+
+    # 2) Doğrudan, senkron sil - süresi ne olursa olsun sonuna kadar beklenir
+    try {
+        Remove-CimInstance -InputObject $profile -ErrorAction Stop
+        Write-Log "Silindi: $localPath" "OK"
+        $success++
+    } catch {
+        Write-Log "Hata ($localPath): $($_.Exception.Message)" "ERROR"
+        $failed++
+    }
+}
+
+Write-Progress -Activity "Kullanıcı profilleri siliniyor" -Completed
+
+Write-Log "===== Tamamlandı: $success başarılı, $failed başarısız / hatalı, toplam $total ====="
+
+# 3) Son durumu özetle (orijinal kontrol komutunun karşılığı)
+Write-Host "`nGüncel profil listesi:`n"
+Get-CimInstance Win32_UserProfile | Select-Object LocalPath, Loaded, Special | Format-Table -AutoSize
+
+Write-Host "`nLog dosyası: $LogPath"
