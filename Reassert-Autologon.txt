@@ -1,0 +1,112 @@
+# Reassert-Autologon.ps1
+# Amac: T2_Computer GPO'su Winlogon\AutoAdminLogon degerini periyodik olarak
+# 0'a resetliyor. Bu script, Group Policy basariyla uygulandiktan hemen sonra
+# (Event ID 8001) tetiklenerek degeri tekrar 1'e ceker ve sifreyi LSA Secret
+# olarak yeniden yazar. Boylece bir sonraki boot'ta registry'de dogru deger
+# bulunur.
+#
+# Yonetici (SYSTEM) baglaminda calismalidir - Task Scheduler ile kurulacak.
+
+param(
+    [Parameter(Mandatory = $true)][string]$Username,
+    [Parameter(Mandatory = $true)][string]$Password,
+    [string]$Domain = "."   # yerel hesap icin "." , domain hesabi icin NETBIOS domain adi
+)
+
+$ErrorActionPreference = "Stop"
+$logPath = "C:\ProgramData\Autologon-Reassert\reassert.log"
+New-Item -ItemType Directory -Force -Path (Split-Path $logPath) | Out-Null
+
+function Write-Log($msg) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logPath -Value "[$ts] $msg"
+}
+
+try {
+    $winlogonPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+
+    $current = (Get-ItemProperty -Path $winlogonPath -Name "AutoAdminLogon" -ErrorAction SilentlyContinue).AutoAdminLogon
+
+    if ($current -eq "1") {
+        Write-Log "AutoAdminLogon zaten 1, mudahale gerekmedi."
+    } else {
+        Write-Log "AutoAdminLogon degeri '$current' bulundu, 1'e cekiliyor."
+    }
+
+    Set-ItemProperty -Path $winlogonPath -Name "AutoAdminLogon" -Value "1" -Type String
+    Set-ItemProperty -Path $winlogonPath -Name "DefaultUserName" -Value $Username -Type String
+    Set-ItemProperty -Path $winlogonPath -Name "DefaultDomainName" -Value $Domain -Type String
+    Remove-ItemProperty -Path $winlogonPath -Name "AutoLogonCount" -ErrorAction SilentlyContinue
+
+    # LSA Secret olarak sifreyi yeniden yaz (DefaultPassword registry degerine
+    # guvenmek yerine - GPO bazi kurulumlarda bunu da temizleyebiliyor).
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Runtime.InteropServices;
+
+    public class LsaSecretHelper {
+        [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+        private static extern uint LsaOpenPolicy(ref LSA_UNICODE_STRING SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, PreserveSig = true)]
+        private static extern uint LsaStorePrivateData(IntPtr PolicyHandle, ref LSA_UNICODE_STRING KeyName, ref LSA_UNICODE_STRING PrivateData);
+
+        [DllImport("advapi32.dll")]
+        private static extern uint LsaClose(IntPtr PolicyHandle);
+
+        [DllImport("advapi32.dll")]
+        private static extern uint LsaNtStatusToWinError(uint status);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_UNICODE_STRING {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LSA_OBJECT_ATTRIBUTES {
+            public int Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public int Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+
+        public static void SetSecret(string key, string value) {
+            LSA_UNICODE_STRING system = new LSA_UNICODE_STRING();
+            LSA_OBJECT_ATTRIBUTES oa = new LSA_OBJECT_ATTRIBUTES();
+            IntPtr policyHandle;
+
+            uint status = LsaOpenPolicy(ref system, ref oa, 0x00000400 | 0x00000800, out policyHandle);
+            if (status != 0) throw new Exception("LsaOpenPolicy failed: " + LsaNtStatusToWinError(status));
+
+            LSA_UNICODE_STRING keyName = new LSA_UNICODE_STRING();
+            keyName.Buffer = Marshal.StringToHGlobalUni(key);
+            keyName.Length = (ushort)(key.Length * 2);
+            keyName.MaximumLength = (ushort)((key.Length + 1) * 2);
+
+            LSA_UNICODE_STRING secretData = new LSA_UNICODE_STRING();
+            secretData.Buffer = Marshal.StringToHGlobalUni(value);
+            secretData.Length = (ushort)(value.Length * 2);
+            secretData.MaximumLength = (ushort)((value.Length + 1) * 2);
+
+            status = LsaStorePrivateData(policyHandle, ref keyName, ref secretData);
+            LsaClose(policyHandle);
+
+            Marshal.FreeHGlobal(keyName.Buffer);
+            Marshal.FreeHGlobal(secretData.Buffer);
+
+            if (status != 0) throw new Exception("LsaStorePrivateData failed: " + LsaNtStatusToWinError(status));
+        }
+    }
+"@
+
+    [LsaSecretHelper]::SetSecret("DefaultPassword", $Password)
+
+    Write-Log "Basarili: AutoAdminLogon=1, kullanici=$Username, domain=$Domain yeniden uygulandi."
+}
+catch {
+    Write-Log "HATA: $($_.Exception.Message)"
+}
